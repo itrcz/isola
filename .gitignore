@@ -1,0 +1,37 @@
+.build/
+dist/
+.DS_Store
+*.ipsw
+*.img
+*.sock
+*.app/
+*.cdr
+*.dmg
+*.sparseimage
+*.sparsebundle/
+*.qcow2
+*.vhdx
+*.vmdk
+*.vmem
+*.vmss
+vm.json
+Hardware.bin
+Machine.bin
+Auxiliary.bin
+Before expansion */
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.p8
+*.key
+__pycache__/
+*.pyc
+
+# Local icon explorations. Only the shipped asset and its creation notes are published.
+/Assets/*.png
+!/Assets/IsolaIcon.png
+/Assets/*.prompt.txt
+!/Assets/IsolaIcon.prompt.txt
+/Design/
