@@ -19,17 +19,24 @@ import Darwin
         let endpoint = ClipboardEndpoint(fd: fd, host: false)
         let performance = GuestPerformance.guest()
         endpoint.onPerformance = { try performance.apply($0) }
-        let mirrors = HomeMirrors()
-        var desired: (Bool, Bool)?
-        endpoint.onIntegration = { desktop, downloads in
-            desired = (desktop, downloads)
-            return mirrors.apply(desktop: desktop, downloads: downloads)
-        }
+        let sleep = SleepInhibitor(keepDisplayAwake: true)
+        endpoint.onPreventSleep = { try sleep.setEnabled($0) }
+        sleep.onError = { endpoint.reportSleepError($0) }
+        let cursor = GuestRemoteCursor()
+        endpoint.onRemoteCursor = { cursor.setEnabled($0) }
+        cursor.send = { endpoint.publishCursor($0) }
+        let restoration = LegacyHomeRestore()
+        var restoreError = restoration.restore()
         endpoint.start()
         let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
-        let monitor = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in Task { @MainActor in if endpoint.closed { exit(1) }
-            if let desired { endpoint.reportStatus(mirrors.apply(desktop: desired.0, downloads: desired.1)) } } }
-        app.run(); withExtendedLifetime((endpoint, monitor)) {}
+        let monitor = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in Task { @MainActor in
+            if endpoint.closed { cursor.stop(); sleep.stop(); exit(1) }
+            if restoreError != nil {
+                restoreError = restoration.restore()
+                endpoint.reportStatus(restoreError ?? L("Локальные папки гостя восстановлены.", "Local guest folders restored."))
+            }
+        } }
+        app.run(); cursor.stop(); sleep.stop(); withExtendedLifetime((endpoint, monitor, sleep, cursor)) {}
     }
     static var destination: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Isola Clipboard/isola-clipboard") }
     static var plist: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/local.isola.clipboard.plist") }
@@ -47,7 +54,7 @@ import Darwin
             let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[0]))
             try data.write(to: destination, options: .atomic)
             try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
-            let config: [String: Any] = ["Label": "local.isola.clipboard", "ProgramArguments": [destination.path], "RunAtLoad": true, "KeepAlive": true, "ThrottleInterval": 5, "LimitLoadToSessionType": "Aqua"]
+            let config: [String: Any] = ["Label": "local.isola.clipboard", "ProgramArguments": [destination.path], "RunAtLoad": true, "KeepAlive": true, "ThrottleInterval": 5, "LimitLoadToSessionType": "Aqua", "ProcessType": "Interactive"]
             try PropertyListSerialization.data(fromPropertyList: config, format: .xml, options: 0).write(to: plist, options: .atomic)
             guard launchctl(["bootstrap", "gui/\(getuid())", plist.path]) == 0 else { throw NSError(domain: "Isola", code: 1, userInfo: [NSLocalizedDescriptionKey: "Не удалось запустить LaunchAgent."]) }
             print("Общий буфер установлен. Копируй текст, изображение или файлы на одной стороне и вставляй на другой. Раскладка синхронизируется, если включена в Isola. Можно закрыть это окно.")
@@ -55,6 +62,7 @@ import Darwin
     }
     static func uninstall() {
         launchctl(["bootout", "gui/\(getuid())/local.isola.clipboard"])
+        if let error = LegacyHomeRestore().restore() { fputs(error + "\n", stderr) }
         try? FileManager.default.removeItem(at: plist)
         try? FileManager.default.removeItem(at: destination)
         print("Помощник буфера обмена удалён из гостевой macOS.")

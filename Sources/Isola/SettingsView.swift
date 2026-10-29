@@ -61,7 +61,7 @@ struct MachineSettings: View {
     @State private var saved = false
     @State private var expandConfirm = false
     var section: Int { model.settingsSection }
-    var locked: Bool { model.busy || model.machine != nil }
+    var locked: Bool { model.busy || model.configurationLocked }
     var resourcesChanged: Bool { cpu != model.cpus || memory != model.memoryGB || disk != (model.actualDiskGB ?? model.diskGB) || title != model.name }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -93,13 +93,16 @@ struct MachineSettings: View {
                                 else { ProgressView().controlSize(.small) }
                             }
                         }
-                        if locked && section != 2 {
+                        if model.suspended {
+                            Label(L("Состояние сохранено. Продолжи VM и выключи macOS, чтобы изменить настройки.", "State saved. Resume and shut down macOS to edit settings."), systemImage: "pause.circle")
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        } else if locked && section != 2 {
                             Label(L("Выключи macOS, чтобы изменить настройки.", "Shut down macOS to edit these settings."), systemImage: "lock")
                                 .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         }
                         if section == 0 { resources }
                         if section == 1 { network }
-                        if section == 2 { integration }
+                        if section == 2 { integration.disabled(model.suspended) }
                     }.padding(.horizontal, 20).padding(.bottom, 24)
                 }.onChange(of: section) { scroll.scrollTo("settings-top", anchor: .top) }
                     .onChange(of: model.error) { if model.error != nil { scroll.scrollTo("settings-top", anchor: .top) } }
@@ -133,15 +136,16 @@ struct MachineSettings: View {
                 if model.installed {
                     Divider()
                     HStack {
-                        Label(model.running ? L("Работает", "Running") : L("Выключена", "Stopped"), systemImage: model.running ? "circle.fill" : "circle")
+                        Label(model.stateTitle, systemImage: model.suspended ? "pause.circle" : model.running ? "circle.fill" : "circle")
                             .font(.system(size: 11)).foregroundStyle(model.running ? Color.green : Color.secondary)
                         Spacer()
                         if model.running {
                             Button(L("Выключить…", "Shut Down")) { model.stop() }.disabled(model.busy)
                         } else {
                             Menu(L("Запуск", "Start Up")) {
-                                Button(L("Запустить macOS", "Start macOS")) { library.start(model) }
-                                Button(L("Запустить в Recovery", "Start in Recovery")) { library.start(model, recovery: true) }
+                                Button(model.startTitle) { library.start(model) }
+                                Button(L("Запустить в Recovery", "Start in Recovery")) { library.start(model, recovery: true) }.disabled(model.suspended)
+                                if model.suspended { DiscardSavedStateButton(model: model) }
                             }.fixedSize().disabled(model.busy)
                         }
                     }
@@ -259,7 +263,7 @@ struct MachineSettings: View {
                     }.frame(height: 100).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
                         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5)).disabled(locked)
                     SettingsDetails(title: L("Как работают исключения", "How domain rules work")) {
-                        SettingsHint(L("Исключения доменов используют DNS гостя. DNS over HTTPS обходит их; общий IP может затронуть другие сайты. Прокси поддерживает TCP и DNS.", "Domain rules use guest DNS. DNS over HTTPS bypasses them; shared IPs may affect other sites. The proxy supports TCP and DNS."))
+                        SettingsHint(L("Исключения доменов используют DNS гостя. DNS over HTTPS обходит их; общий IP может затронуть другие сайты. Прокси поддерживает TCP и DNS. NTP получает время хоста локально.", "Domain rules use guest DNS. DNS over HTTPS bypasses them; shared IPs may affect other sites. The proxy supports TCP and DNS. NTP uses the host clock locally."))
                     }
                 }
             }
@@ -275,9 +279,19 @@ struct MachineSettings: View {
 
     var integration: some View {
         VStack(alignment: .leading, spacing: 20) {
+            RemoteSharingSettings(host: model.remoteHost, running: model.running && !model.busy)
             SettingsGroup(title: L("Комфорт", "Experience"), icon: "slider.horizontal.3") {
                 PreferenceToggle(title: L("Оптимизировать производительность", "Optimize performance"), subtitle: L("Меньше анимаций, прозрачности и размытия.", "Reduce motion, transparency and blur."), isOn: Binding(get: { model.optimizePerformance }, set: { model.setPerformance($0) })).disabled(model.busy)
                 if !model.performanceStatus.isEmpty { SettingsHint(model.performanceStatus) }
+                Divider()
+                PreferenceToggle(title: L("Не усыплять гостевую macOS", "Keep guest macOS awake"), subtitle: L("Запускает caffeinate -dis внутри гостя. Нужен Isola Tools.", "Run caffeinate -dis inside the guest. Requires Isola Tools."), isOn: Binding(get: { model.preventGuestSleep }, set: { model.setSleep(guest: $0) })).disabled(model.busy)
+                if let version = model.toolsVersion, version < 8 {
+                    Label(L("В госте старая версия Tools. Запусти Install Clipboard.command с диска Isola Tools один раз для обновления.", "The guest has older Tools. Run Install Clipboard.command from the Isola Tools disk once to update."), systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                }
+                if !model.sleepStatus.isEmpty { SettingsHint(model.sleepStatus) }
+                Divider()
+                PreferenceToggle(title: L("Не усыплять хост во время VM", "Keep this Mac awake while running"), subtitle: L("Отдельно запрещает сон хоста при простое. Его экран может гаснуть.", "Prevent idle sleep on this Mac. Its display can still sleep."), isOn: Binding(get: { model.preventHostSleep }, set: { model.setSleep(host: $0) })).disabled(model.busy)
                 Divider()
                 PreferenceToggle(title: L("Сочетания клавиш на хосте", "Keep shortcuts on this Mac"), subtitle: L("Cmd+Tab и системные сочетания управляют хостом.", "Cmd+Tab and system shortcuts control the host."), isOn: $model.hostShortcuts)
                     .onChange(of: model.hostShortcuts) { if model.machine == nil { persist() } }
@@ -296,41 +310,37 @@ struct MachineSettings: View {
                 }
             }
             SettingsGroup(title: L("Общие папки", "Shared Folders"), icon: "folder") {
-                PreferenceToggle(title: L("Рабочий стол", "Desktop"), subtitle: "", isOn: $model.mirrorDesktop)
-                    .disabled(locked).onChange(of: model.mirrorDesktop) { persist() }
-                Divider()
-                PreferenceToggle(title: L("Загрузки", "Downloads"), subtitle: "", isOn: $model.mirrorDownloads)
-                    .disabled(locked).onChange(of: model.mirrorDownloads) { persist() }
-                SettingsHint(L("Одни файлы в обеих системах. Изменения и удаления тоже общие.", "The same files in both systems. Edits and deletions are shared too."))
-                SettingsDetails(title: L("Где прежние файлы гостя", "Where guest files are kept")) {
-                    SettingsHint(L("Прежние Desktop и Downloads сохранены в ~/Library/Application Support/Isola Integration. При отключении общих папок они вернутся на место.", "Original Desktop and Downloads folders are saved in ~/Library/Application Support/Isola Integration and restored when sharing is turned off."))
-                }
-                if !model.sharedFolders.isEmpty { Divider() }
-                ForEach($model.sharedFolders) { $folder in
+                SettingsHint(L("Папки доступны в госте в Finder → My Shared Files. Работай с файлами прямо там — без копирования через буфер.", "Folders appear in guest Finder → My Shared Files. Work on files there directly, without clipboard transfers."))
+                ForEach(model.sharedFolders) { folder in
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 8) {
                             Image(systemName: "folder.fill").foregroundStyle(.secondary)
-                            Text(URL(fileURLWithPath: folder.path).lastPathComponent).font(.system(size: 12)).lineLimit(1).truncationMode(.middle).help(folder.path)
+                            Text(folder.mountName).font(.system(size: 12)).lineLimit(1).truncationMode(.middle).help(folder.path)
                             Spacer()
-                            Button { model.sharedFolders.removeAll { $0.id == folder.id }; persist() } label: { Image(systemName: "minus.circle").foregroundStyle(.secondary) }
+                            Button { model.updateSharedFolders(model.sharedFolders.filter { $0.id != folder.id }) } label: { Image(systemName: "minus.circle").foregroundStyle(.secondary) }
                                 .buttonStyle(.plain).help(L("Отключить папку", "Stop sharing folder"))
-                                .accessibilityLabel(L("Отключить папку ", "Stop sharing ") + URL(fileURLWithPath: folder.path).lastPathComponent)
+                                .accessibilityLabel(L("Отключить папку ", "Stop sharing ") + folder.mountName)
                         }
-                        Toggle(L("Только чтение", "Read only"), isOn: $folder.readOnly).font(.caption).onChange(of: folder.readOnly) { persist() }
-                    }.disabled(locked)
+                        Toggle(L("Только чтение", "Read only"), isOn: Binding(get: { folder.readOnly }, set: { enabled in
+                            var folders = model.sharedFolders
+                            if let index = folders.firstIndex(where: { $0.id == folder.id }) { folders[index].readOnly = enabled; model.updateSharedFolders(folders) }
+                        })).font(.caption)
+                    }.disabled(model.busy)
                     Divider()
                 }
                 Button { model.addSharedFolders() } label: { Label(L("Добавить папку…", "Add Folder…"), systemImage: "plus") }
-                    .disabled(locked)
+                    .disabled(model.busy)
+                SettingsHint(L("Общий доступ меняется без перезапуска VM. В режиме записи изменения и удаления видны в обеих системах.", "Sharing updates without restarting the VM. With write access, edits and deletions affect both systems."))
             }
             if locked {
-                Label(L("Буфер, раскладка и папки меняются при выключенной macOS.", "Shut down macOS to change clipboard, layout and folder sharing."), systemImage: "lock")
+                Label(L("Буфер и раскладка меняются при выключенной macOS.", "Shut down macOS to change clipboard and layout sync."), systemImage: "lock")
                     .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             } else {
-                SettingsHint(L("Буфер, раскладка и папки применятся при следующем запуске.", "Clipboard, layout and folder changes apply on the next start."))
+                SettingsHint(L("Буфер и раскладка применятся при следующем запуске.", "Clipboard and layout changes apply on the next start."))
             }
             SettingsGroup(title: "Isola Tools", icon: "puzzlepiece.extension") {
                 SettingsHint(model.integrationStatus)
+                SettingsHint(L("После обновления Isola переустанови Tools в госте один раз. При изменении галочек запускать установщик не нужно.", "After updating Isola, reinstall Tools in the guest once. Checkbox changes do not require rerunning the installer."))
                 if !model.keyboardStatus.isEmpty { SettingsHint(model.keyboardStatus) }
                 SettingsDetails(title: L("Установка и помощь", "Setup and Help")) {
                     SettingsHint(L("В госте открой диск Isola Tools и запусти Install Clipboard.command. Для обновления запусти его снова. Дополнительные папки доступны в Finder → My Shared Files.", "In the guest, open the Isola Tools disk and run Install Clipboard.command. Run it again to update. Additional folders appear in Finder → My Shared Files."))

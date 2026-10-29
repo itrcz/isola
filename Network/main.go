@@ -109,6 +109,8 @@ type Gateway struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	slots       chan struct{}
+	timeSlots   chan struct{}
+	timeReplies atomic.Uint64
 	frames      atomic.Uint64
 	oversize    atomic.Uint64
 	tcpDials    atomic.Uint64
@@ -124,7 +126,7 @@ func newGateway(config Config, emit func([]byte)) (*Gateway, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	g := &Gateway{config: config, emit: emit, ctx: ctx, cancel: cancel, slots: make(chan struct{}, 256)}
+	g := &Gateway{config: config, emit: emit, ctx: ctx, cancel: cancel, slots: make(chan struct{}, 256), timeSlots: make(chan struct{}, 16)}
 	g.guestMAC = append(net.HardwareAddr(nil), guestMAC...)
 	if config.GuestMAC != "" {
 		g.guestMAC, _ = net.ParseMAC(config.GuestMAC)
@@ -143,7 +145,11 @@ func newGateway(config Config, emit func([]byte)) (*Gateway, error) {
 	g.s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
 	g.s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcp.NewForwarder(g.s, 0, 128, g.forwardTCP).HandlePacket)
 	dnsForwarder := udp.NewForwarder(g.s, g.forwardDNS)
+	timeServer := udp.NewForwarder(g.s, g.serveTime)
 	g.s.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		if id.LocalPort == 123 {
+			return timeServer.HandlePacket(id, pkt)
+		}
 		if id.LocalPort != 53 {
 			g.udpBlocked.Add(1)
 			// Let the local stack return ICMP port-unreachable, so QUIC can
@@ -253,7 +259,7 @@ func (g *Gateway) forwardTCP(r *tcp.ForwarderRequest) {
 	}()
 }
 func (g *Gateway) forwardDNS(r *udp.ForwarderRequest) {
-	// All other UDP (including QUIC, STUN and multicast) is dropped. No direct fallback.
+	// NTP is served locally by serveTime. Other UDP has no direct fallback.
 	if r.ID().LocalPort != 53 {
 		g.udpBlocked.Add(1)
 		return
@@ -401,7 +407,7 @@ func (g *Gateway) dhcp(d *layers.DHCPv4) {
 	lease := make([]byte, 4)
 	binary.BigEndian.PutUint32(lease, 86400)
 	answer := &layers.DHCPv4{Operation: layers.DHCPOpReply, HardwareType: layers.LinkTypeEthernet, HardwareLen: 6, Xid: d.Xid, Flags: d.Flags, YourClientIP: guestIP, NextServerIP: gatewayIP, ClientHWAddr: g.guestMAC, Options: layers.DHCPOptions{
-		layers.NewDHCPOption(layers.DHCPOptMessageType, []byte{reply}), layers.NewDHCPOption(layers.DHCPOptServerID, gatewayIP), layers.NewDHCPOption(layers.DHCPOptLeaseTime, lease), layers.NewDHCPOption(layers.DHCPOptSubnetMask, []byte{255, 255, 255, 0}), layers.NewDHCPOption(layers.DHCPOptRouter, gatewayIP), layers.NewDHCPOption(layers.DHCPOptDNS, gatewayIP)}}
+		layers.NewDHCPOption(layers.DHCPOptMessageType, []byte{reply}), layers.NewDHCPOption(layers.DHCPOptServerID, gatewayIP), layers.NewDHCPOption(layers.DHCPOptLeaseTime, lease), layers.NewDHCPOption(layers.DHCPOptSubnetMask, []byte{255, 255, 255, 0}), layers.NewDHCPOption(layers.DHCPOptRouter, gatewayIP), layers.NewDHCPOption(layers.DHCPOptDNS, gatewayIP), layers.NewDHCPOption(layers.DHCPOpt(42), gatewayIP)}}
 	ip := &layers.IPv4{Version: 4, IHL: 5, TTL: 64, Protocol: layers.IPProtocolUDP, SrcIP: gatewayIP, DstIP: net.IPv4bcast}
 	u := &layers.UDP{SrcPort: 67, DstPort: 68}
 	u.SetNetworkLayerForChecksum(ip)
@@ -512,5 +518,5 @@ func fatal(message string) { fmt.Fprintln(os.Stderr, message); os.Exit(1) }
 
 func (g *Gateway) metrics() map[string]uint64 {
 	s := g.s.Stats()
-	return map[string]uint64{"send_errors": g.sendErrors.Load(), "frames": g.frames.Load(), "oversize": g.oversize.Load(), "tcp_dials": g.tcpDials.Load(), "tcp_failures": g.tcpFailures.Load(), "dns_queries": g.dnsQueries.Load(), "dns_failures": g.dnsFailures.Load(), "udp_blocked": g.udpBlocked.Load(), "tcp_checksum_errors": s.TCP.ChecksumErrors.Value(), "udp_checksum_errors": s.UDP.ChecksumErrors.Value(), "ip_malformed": s.IP.MalformedPacketsReceived.Value(), "tcp_retransmits": s.TCP.Retransmits.Value(), "tcp_invalid": s.TCP.InvalidSegmentsReceived.Value(), "tcp_connected": s.TCP.CurrentConnected.Value(), "udp_buffer_errors": s.UDP.ReceiveBufferErrors.Value()}
+	return map[string]uint64{"send_errors": g.sendErrors.Load(), "frames": g.frames.Load(), "oversize": g.oversize.Load(), "tcp_dials": g.tcpDials.Load(), "tcp_failures": g.tcpFailures.Load(), "dns_queries": g.dnsQueries.Load(), "dns_failures": g.dnsFailures.Load(), "udp_blocked": g.udpBlocked.Load(), "time_replies": g.timeReplies.Load(), "tcp_checksum_errors": s.TCP.ChecksumErrors.Value(), "udp_checksum_errors": s.UDP.ChecksumErrors.Value(), "ip_malformed": s.IP.MalformedPacketsReceived.Value(), "tcp_retransmits": s.TCP.Retransmits.Value(), "tcp_invalid": s.TCP.InvalidSegmentsReceived.Value(), "tcp_connected": s.TCP.CurrentConnected.Value(), "udp_buffer_errors": s.UDP.ReceiveBufferErrors.Value()}
 }

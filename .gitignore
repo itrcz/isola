@@ -35,3 +35,9 @@ __pycache__/
 /Assets/*.prompt.txt
 !/Assets/IsolaIcon.prompt.txt
 /Design/
+
+# Persistent VM memory and interrupted save/restore transactions.
+Suspended.vmstate/
+.suspend-preparing/
+.resume-in-progress/
+.session.lock

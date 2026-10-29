@@ -29,6 +29,7 @@ struct MachineTabs: View {
                     ForEach(library.models, id: \.folder.path) { model in
                         MachineTab(model: model, library: library).id(model.folder.path)
                     }
+                    if let remote = library.remote { RemoteTab(client: remote, library: library) }
                 }.padding(.horizontal, 2)
             }.onChange(of: library.selection) { scroll.scrollTo(library.selection) }
         }.frame(height: 34)
@@ -41,6 +42,8 @@ struct AddMachineButton: View {
         Menu {
             Button(L("Новая машина…", "New Machine…")) { library.add(existing: false) }
             Button(L("Добавить существующую…", "Add Existing Machine…")) { library.add(existing: true) }
+            Divider()
+            Button(L("В локальной сети…", "Local Network…")) { library.showRemoteBrowser = true }
         } label: { Image(systemName: "plus").frame(width: 26, height: 28) }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
             .help(L("Добавить виртуальную машину", "Add virtual machine"))
@@ -52,12 +55,12 @@ struct MachineTab: View {
     @ObservedObject var model: Model
     @ObservedObject var library: Library
     @State private var confirmForce = false
-    var selected: Bool { library.selection == model.folder.path }
+    var selected: Bool { !library.remoteSelected && library.selection == model.folder.path }
     var body: some View {
         Button { library.select(model) } label: {
             HStack(spacing: 8) {
                 if model.busy { ProgressView().controlSize(.mini) }
-                else { Image(systemName: "desktopcomputer").font(.system(size: 12)).foregroundStyle(selected ? .primary : .secondary) }
+                else { Image(systemName: model.suspended ? "pause.circle" : "desktopcomputer").font(.system(size: 12)).foregroundStyle(selected ? .primary : .secondary) }
                 Text(model.name).font(.system(size: 12, weight: selected ? .semibold : .regular))
                     .lineLimit(1).frame(minWidth: 50, maxWidth: 140, alignment: .leading)
                 if model.error != nil || model.running {
@@ -66,21 +69,23 @@ struct MachineTab: View {
             }.padding(.horizontal, 12).frame(height: 30).contentShape(Rectangle())
         }.buttonStyle(.plain)
             .background(selected ? Color.primary.opacity(0.07) : .clear, in: RoundedRectangle(cornerRadius: 8))
-            .accessibilityLabel(model.name + ", " + (model.running ? L("Работает", "Running") : L("Выключена", "Stopped")))
+            .accessibilityLabel(model.name + ", " + model.stateTitle)
             .help(model.error ?? model.status)
             .contextMenu {
                 Button(L("Настройки…", "Settings…")) { library.select(model); model.settingsVisible = true }
                 Divider()
-                if model.running {
+                if model.machine != nil {
+                    Button(L("Приостановить", "Suspend")) { model.suspend() }.disabled(model.busy)
                     Button(L("Выключить", "Shut Down")) { model.stop() }.disabled(model.busy)
                     Button(L("Принудительно остановить…", "Force Stop…"), role: .destructive) { confirmForce = true }.disabled(model.busy)
                 } else {
-                    Button(L("Запустить", "Start")) { library.select(model); library.start(model) }.disabled(model.busy || !model.installed)
-                    Button(L("Запустить в Recovery", "Start in Recovery")) { library.select(model); library.start(model, recovery: true) }.disabled(model.busy || !model.installed)
+                    Button(model.startTitle) { library.select(model); library.start(model) }.disabled(model.busy || !model.installed)
+                    Button(L("Запустить в Recovery", "Start in Recovery")) { library.select(model); library.start(model, recovery: true) }.disabled(model.busy || !model.installed || model.suspended)
+                    if model.suspended { DiscardSavedStateButton(model: model) }
                 }
                 Divider()
                 Button(L("Убрать из списка (файлы сохранятся)", "Remove from Library (Keep Files)")) { library.select(model); library.removeSelected() }
-                    .disabled(library.models.count < 2 || model.running || model.busy)
+                    .disabled(library.models.count < 2 || model.machine != nil || model.busy)
             }
             .confirmationDialog(L("Принудительно остановить VM? Несохранённые данные могут быть потеряны.", "Force stop the VM? Unsaved changes may be lost."), isPresented: $confirmForce) {
                 Button(L("Остановить", "Force Stop"), role: .destructive) { model.forceStop() }
@@ -94,7 +99,11 @@ struct MachineControls: View {
     @State private var confirmForce = false
     var body: some View {
         HStack(spacing: 8) {
-            if model.running {
+            if model.machine != nil {
+                Button { model.suspend() } label: { Image(systemName: "pause.fill").font(.system(size: 12)) }
+                    .buttonStyle(ChromeButton()).disabled(model.busy)
+                    .help(L("Приостановить и сохранить на диск", "Suspend and save to disk"))
+                    .accessibilityLabel(L("Приостановить VM", "Suspend VM"))
                 Menu {
                     Button(L("Выключить macOS", "Shut Down macOS")) { model.stop() }
                     Divider()
@@ -106,7 +115,7 @@ struct MachineControls: View {
             } else if model.installed {
                 Button { library.start(model) } label: { Image(systemName: "play.fill").font(.system(size: 12)) }
                     .buttonStyle(ChromeButton()).disabled(model.busy)
-                    .help(L("Запустить macOS", "Start macOS")).accessibilityLabel(L("Запустить macOS", "Start macOS"))
+                    .help(model.startTitle).accessibilityLabel(model.startTitle)
             }
             Button { model.settingsVisible.toggle() } label: { Image(systemName: "sidebar.right") }
                 .buttonStyle(ChromeButton(selected: model.settingsVisible))
@@ -127,13 +136,18 @@ struct ContentView: View {
                 MachineTabs(library: library)
                 AddMachineButton(library: library)
                 Divider().frame(height: 16).padding(.horizontal, 2)
-                MachineControls(model: library.selected, library: library)
+                if library.remoteSelected {
+                    Button { library.closeRemote() } label: { Image(systemName: "xmark") }
+                        .buttonStyle(ChromeButton()).help(L("Отключиться от VM", "Disconnect from VM"))
+                } else { MachineControls(model: library.selected, library: library) }
             }
             .padding(.leading, 88).padding(.trailing, 14).frame(height: 48)
             .background(WindowDragArea()).background(TitlebarMaterial())
             Divider().opacity(0.45)
-            MachineWorkspace(model: library.selected, library: library).id(library.selection)
+            if library.remoteSelected, let remote = library.remote { RemoteWorkspace(client: remote) }
+            else { MachineWorkspace(model: library.selected, library: library).id(library.selection) }
         }.ignoresSafeArea().frame(minWidth: 760, minHeight: 480)
+            .sheet(isPresented: $library.showRemoteBrowser) { RemoteBrowserSheet(library: library, discovery: library.discovery) }
     }
 }
 
@@ -145,7 +159,14 @@ struct MachineWorkspace: View {
             HStack(spacing: 0) {
                 ZStack {
                     Color(nsColor: .windowBackgroundColor)
-                    if model.machine != nil { GuestScreen(model: model) }
+                    if model.remoteControlActive {
+                        VStack(spacing: 14) {
+                            Image(systemName: "network").font(.system(size: 36)).foregroundStyle(.secondary)
+                            Text(L("VM открыта на другом Mac", "VM is open on another Mac")).font(.title3)
+                            Button(L("Забрать управление", "Take Control")) { model.remoteHost.takeControl() }
+                                .buttonStyle(.borderedProminent)
+                        }
+                    } else if model.machine != nil { GuestScreen(model: model) }
                     else { welcome }
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
                 if model.settingsVisible {
@@ -166,7 +187,7 @@ struct MachineWorkspace: View {
                 IsolaMark(size: 132)
                 VStack(spacing: 7) {
                     Text(model.name).font(.system(size: 27, weight: .semibold)).lineLimit(2).multilineTextAlignment(.center)
-                    Text(model.installed ? L("Готова к работе", "Ready when you are") : L("Твоя macOS. Отдельное пространство.", "Your macOS. A space of its own."))
+                    Text(model.suspended ? L("Состояние сохранено. Продолжи с того же места.", "State saved. Pick up where you left off.") : model.installed ? L("Готова к работе", "Ready when you are") : L("Твоя macOS. Отдельное пространство.", "Your macOS. A space of its own."))
                         .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                 }
                 if model.installed {
@@ -185,8 +206,9 @@ struct MachineWorkspace: View {
                 } else if model.installed {
                     VStack(spacing: 12) {
                         Button { library.start(model) } label: {
-                            Label(L("Запустить macOS", "Start macOS"), systemImage: "play.fill").padding(.horizontal, 16).padding(.vertical, 5)
+                            Label(model.startTitle, systemImage: "play.fill").padding(.horizontal, 16).padding(.vertical, 5)
                         }.buttonStyle(.borderedProminent).controlSize(.large)
+                        if model.suspended { DiscardSavedStateButton(model: model).buttonStyle(.link).font(.caption) }
                         Button(L("Настройки машины", "Machine Settings")) { model.settingsVisible.toggle() }
                             .buttonStyle(.link).font(.callout)
                     }.padding(.top, 6)
@@ -209,5 +231,19 @@ struct MachineWorkspace: View {
     func summary(_ icon: String, _ value: String) -> some View {
         Label(value, systemImage: icon).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             .fixedSize()
+    }
+}
+
+struct DiscardSavedStateButton: View {
+    @ObservedObject var model: Model
+    @State private var confirm = false
+    var body: some View {
+        Button(L("Удалить сохранённое состояние…", "Discard Saved State…"), role: .destructive) { confirm = true }
+            .disabled(model.busy || model.machine != nil)
+            .confirmationDialog(L("Удалить сохранённое состояние?", "Discard saved state?"), isPresented: $confirm) {
+                Button(L("Удалить состояние", "Discard State"), role: .destructive) { model.discardSavedState() }
+            } message: {
+                Text(L("Открытые приложения и несохранённые изменения в госте будут потеряны, как при принудительном выключении. Файлы на диске VM сохранятся.", "Open apps and unsaved changes in the guest will be lost, as with a force stop. Files on the VM disk will be kept."))
+            }
     }
 }

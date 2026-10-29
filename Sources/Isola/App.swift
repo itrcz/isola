@@ -94,14 +94,53 @@ struct WindowDragArea: NSViewRepresentable {
     @objc func toggleSettings() { model.settingsVisible.toggle() }
     func windowDidResize(_ notification: Notification) { positionWindowButtons() }
     func windowDidExitFullScreen(_ notification: Notification) { positionWindowButtons() }
+    private var savingForQuit = false
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if library.models.contains(where: { $0.running || $0.busy }) {
-            let alert = NSAlert(); alert.messageText = L("Закрыть Isola?", "Quit Isola?"); alert.informativeText = L("Работающая VM или установка будут прерваны. Лучше сначала выключить macOS из гостевой системы.", "The running VM or installation will be interrupted. Shut down guest macOS first."); alert.addButton(withTitle: L("Остаться", "Stay")); alert.addButton(withTitle: L("Закрыть", "Quit"))
-            return alert.runModal() == .alertFirstButtonReturn ? .terminateCancel : .terminateNow
+        guard !savingForQuit else { return .terminateCancel }
+        if library.models.contains(where: { $0.busy }) {
+            let alert = NSAlert()
+            alert.messageText = L("Дождись завершения операции", "Wait for the current operation")
+            alert.informativeText = L("Isola закончит установку, запуск или сохранение VM. После этого можно выйти.", "Let Isola finish installing, starting or saving the VM before quitting.")
+            alert.runModal(); return .terminateCancel
         }
-        return .terminateNow
+        let active = library.models.filter { $0.machine != nil }
+        guard !active.isEmpty else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = L("Сохранить VM перед выходом?", "Save the VM before quitting?")
+        alert.informativeText = L("Открытые приложения останутся в сохранённом состоянии. После запуска Isola нажми «Продолжить macOS».", "Open apps will remain in the saved state. Next time you open Isola, choose Resume macOS.")
+        alert.addButton(withTitle: L("Сохранить и выйти", "Save & Quit"))
+        alert.addButton(withTitle: L("Отмена", "Cancel"))
+        alert.addButton(withTitle: L("Выключить принудительно…", "Force Quit…"))
+        let response = alert.runModal()
+        if response == .alertThirdButtonReturn {
+            let warning = NSAlert(); warning.alertStyle = .warning
+            warning.messageText = L("Прервать работу VM?", "Interrupt the VM?")
+            warning.informativeText = L("Несохранённые изменения в госте будут потеряны.", "Unsaved changes in the guest will be lost.")
+            warning.addButton(withTitle: L("Отмена", "Cancel")); warning.addButton(withTitle: L("Прервать и выйти", "Force Quit"))
+            return warning.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+        }
+        guard response == .alertFirstButtonReturn else { return .terminateCancel }
+        savingForQuit = true
+        active.forEach { $0.busy = true; $0.error = nil }
+        Task { @MainActor in
+            var succeeded = true
+            for model in active {
+                do { try await model.suspendMachine() }
+                catch {
+                    succeeded = false; model.error = Model.describe(error)
+                    model.status = L("Не удалось сохранить VM. Isola остаётся открытой.", "Could not save the VM. Isola will stay open.")
+                    library.select(model); model.settingsVisible = true
+                    break
+                }
+            }
+            active.forEach { $0.busy = false }
+            savingForQuit = false
+            sender.reply(toApplicationShouldTerminate: succeeded)
+            if !succeeded { window.makeKeyAndOrderFront(nil) }
+        }
+        return .terminateLater
     }
-    func applicationWillTerminate(_ notification: Notification) { library.models.forEach { $0.cleanup() } }
+    func applicationWillTerminate(_ notification: Notification) { library.closeRemote(); library.discovery.stop(); library.models.forEach { $0.cleanup() } }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { window.makeKeyAndOrderFront(nil); return true }
 }
 #if !WINDOW_LIFECYCLE_TEST

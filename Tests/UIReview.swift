@@ -20,6 +20,11 @@ import SwiftUI
         if arguments.contains("--proxy") { model.networkMode = "proxy" }
         model.integrationStatus = L("Помощник подключится после запуска macOS.", "Tools will connect when macOS starts.")
         if arguments.contains("--error") { model.error = L("Не удалось подключиться к прокси. Проверь адрес сервера и порт.", "Could not connect to the proxy. Check the server address and port.") }
+        if arguments.contains("--suspended") {
+            try model.saveRecord(installed: true)
+            try FileManager.default.createDirectory(at: model.savedState.committed, withIntermediateDirectories: true)
+            model.reload()
+        }
         let library = Library(); library.models = [model]; library.selection = model.folder.path
         if arguments.contains("--tabs") {
             for name in ["Development", "Testing", "macOS Sequoia", "Work"] {

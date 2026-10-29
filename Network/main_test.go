@@ -272,11 +272,17 @@ func TestDHCPAndARP(t *testing.T) {
 		if !bytes.Equal(d.ClientHWAddr, guestMAC) || d.Xid != 42 || !d.YourClientIP.Equal(guestIP) {
 			t.Fatal("bad lease")
 		}
-		dns := false
+		dns, ntp := false, false
 		for _, o := range d.Options {
+			if o.Type == layers.DHCPOpt(42) {
+				ntp = net.IP(o.Data).Equal(gatewayIP)
+			}
 			if o.Type == layers.DHCPOptDNS {
 				dns = net.IP(o.Data).Equal(gatewayIP)
 			}
+		}
+		if !ntp {
+			t.Fatal("DHCP did not advertise local time server")
 		}
 		if !dns {
 			t.Fatal("DHCP advertised non-proxied DNS")

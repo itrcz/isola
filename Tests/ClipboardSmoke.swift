@@ -13,7 +13,7 @@ import Darwin
         a.clearContents(); a.setString("host initial — привет", forType: .string)
         b.clearContents(); b.setString("guest initial", forType: .string)
         host.start(); guest.start()
-        func pump() { for _ in 0..<20 { host.tick(); guest.tick() } }
+        func pump() { RunLoop.main.run(until: Date().addingTimeInterval(0.35)) }
         pump(); precondition(host.connected && guest.connected)
         precondition(b.string(forType: .string) == "host initial — привет")
         b.clearContents(); b.setString("from guest 🐈", forType: .string)
@@ -44,13 +44,13 @@ import Darwin
         b.clearContents(); b.writeObjects([file as NSURL]); pump()
         let reverse = a.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as! [URL]
         let reverseData = try Data(contentsOf: reverse[0]); precondition(reverseData == png)
-        host.stop(); guest.tick(); precondition(guest.closed)
+        host.stop(); pump(); precondition(guest.closed)
         var malformed: [Int32] = [-1,-1]
         precondition(socketpair(AF_UNIX, SOCK_STREAM, 0, &malformed) == 0)
         let endpoint = ClipboardEndpoint(fd: malformed[0], host: true, pasteboard: a)
         let header: [UInt8] = [255,255,255,255]
         _ = header.withUnsafeBytes { Darwin.write(malformed[1], $0.baseAddress, $0.count) }
-        endpoint.tick(); precondition(endpoint.closed); Darwin.close(malformed[1])
+        endpoint.start(); pump(); precondition(endpoint.closed); Darwin.close(malformed[1])
         var layoutSockets: [Int32] = [-1, -1]
         precondition(socketpair(AF_UNIX, SOCK_STREAM, 0, &layoutSockets) == 0)
         var layout = "com.apple.keylayout.US"; var guestLayout = "com.apple.keylayout.ABC"; var selected: [String] = []
@@ -60,32 +60,41 @@ import Darwin
         a.clearContents(); a.setString("host private", forType: .string)
         b.clearContents(); b.setString("guest private", forType: .string)
         var modes: [Bool] = []; var performanceStatus = ""
+        var sleepModes: [Bool] = []
+        layoutGuest.onPreventSleep = { sleepModes.append($0) }
         layoutGuest.onPerformance = { modes.append($0) }
         layoutHost.onPerformanceStatus = { performanceStatus = $0 }
         layoutHost.start(); layoutGuest.start()
-        for _ in 0..<20 { layoutHost.tick(); layoutGuest.tick() }
+        pump()
         precondition(selected == [layout])
+        precondition(sleepModes == [false])
+        layoutHost.setPreventSleep(true); pump()
+        layoutHost.setPreventSleep(false); pump()
+        precondition(sleepModes == [false, true, false])
         precondition(modes == [false], "initial performance preference missing")
         layoutHost.setPerformance(true)
-        for _ in 0..<20 { layoutHost.tick(); layoutGuest.tick() }
+        pump()
         precondition(modes == [false, true] && performanceStatus.contains("Reduced effects"))
         layoutHost.setPerformance(false)
-        for _ in 0..<20 { layoutHost.tick(); layoutGuest.tick() }
+        pump()
         precondition(modes == [false, true, false] && performanceStatus.contains("restored"))
         layout = "com.apple.keylayout.Russian"
-        for _ in 0..<20 { layoutHost.tick(); layoutGuest.tick() }
+        pump()
         precondition(selected == ["com.apple.keylayout.US", layout])
         guestLayout = "com.apple.keylayout.US"
-        for _ in 0..<20 { layoutGuest.tick(); layoutHost.tick() }
+        pump()
         precondition(layout == guestLayout, "guest layout did not reach host")
         let switches = selected.count
-        for _ in 0..<20 { layoutHost.tick(); layoutGuest.tick() }
+        pump()
         precondition(selected.count == switches, "layout echo loop")
         layout = "com.apple.keylayout.Russian"; guestLayout = "com.apple.keylayout.ABC"
         // Both events are queued before either side reads the competing update.
         layoutHost.publishInputSource(); layoutGuest.publishInputSource()
-        for _ in 0..<20 { layoutHost.tick(); layoutGuest.tick() }
+        pump()
         precondition(layout == guestLayout && layout == "com.apple.keylayout.Russian", "concurrent changes failed to converge")
+        guestLayout = "com.apple.keylayout.ABC"
+        layoutGuest.tick(now: Date().addingTimeInterval(10)); pump()
+        precondition(layout == "com.apple.keylayout.Russian" && guestLayout == layout, "stale guest layout won after wake")
         precondition(a.string(forType: .string) == "host private" && b.string(forType: .string) == "guest private", "disabled clipboard changed")
         print("PASS: bidirectional layout sync without clipboard or echo loops,  handshake, bidirectional Unicode text, image, bidirectional files, no feedback, missing file rejection, clear, size bound, EOF, malformed frame")
     }

@@ -11,11 +11,14 @@ struct SharedFolder: Codable, Identifiable {
     var id = UUID()
     var path: String
     var readOnly = true
+    var shareName: String? = nil
+    var mountName: String { shareName ?? id.uuidString + "-" + URL(fileURLWithPath: path).lastPathComponent }
 }
 struct VMRecord: Codable {
     var networkMode: String? = nil; var directRules: String? = nil
     var sharedFolders: [SharedFolder]? = nil; var syncKeyboard: Bool? = nil
-    var mirrorDesktop: Bool? = nil; var mirrorDownloads: Bool? = nil; var diskBackup: String? = nil
+    var diskBackup: String? = nil
+    var preventGuestSleep: Bool? = nil; var preventHostSleep: Bool? = nil
     var optimizePerformance: Bool? = nil
     var memoryGB: Int; var cpus: Int; var installed: Bool; var macAddress: String? = nil
     var name: String? = nil; var diskGB: Int? = nil
@@ -34,8 +37,11 @@ struct VMRecord: Codable {
     @Published var syncKeyboard = true
     @Published var optimizePerformance = false
     @Published var performanceStatus = ""
-    @Published var mirrorDesktop = true
-    @Published var mirrorDownloads = true
+    @Published var preventGuestSleep = false
+    @Published var preventHostSleep = false
+    @Published var sleepStatus = ""
+    @Published var toolsVersion: Int?
+    private let hostSleep = SleepInhibitor(keepDisplayAwake: false)
     @Published var integrationStatus = L("Isola Tools: ожидает подключения", "Isola Tools: waiting for connection")
     @Published var keyboardStatus = ""
     @Published var folder = URL(fileURLWithPath: UserDefaults.standard.string(forKey: "vm.folder") ?? (NSHomeDirectory() + "/Library/Application Support/Isola/VM"))
@@ -55,6 +61,8 @@ struct VMRecord: Codable {
     @Published var diskExpansionPending = false
     @Published var diskBackup: String?
     var displayView: VZVirtualMachineView?
+    @Published var remoteControlActive = false
+    lazy var remoteHost = RemoteHost(model: self)
     @Published var busy = false
     @Published var status = L("Выбери режим сети и образ macOS.", "Choose a network mode and a macOS image.")
     @Published var error: String?
@@ -62,10 +70,17 @@ struct VMRecord: Codable {
     @Published var machine: VZVirtualMachine?
     @Published var running = false
     @Published var installed = false
+    @Published private(set) var suspended = false
+    var savedState: SuspendedState { SuspendedState(folder: folder) }
+    var configurationLocked: Bool { machine != nil || savedState.exists }
+    var startTitle: String { suspended ? L("Продолжить macOS", "Resume macOS") : L("Запустить macOS", "Start macOS") }
+    var stateTitle: String { suspended ? L("Приостановлена", "Suspended") : running ? L("Работает", "Running") : L("Выключена", "Stopped") }
+    private var machineConfiguration: VZVirtualMachineConfiguration?
+    private var suspending = false
     @Published var progress: Double?
     private var macAddress = "02:49:53:00:00:02"
     private var bridge: NetworkBridge?
-    private var clipboardBridge: ClipboardBridge?
+    var clipboardBridge: ClipboardBridge?
     private var installer: VZMacOSInstaller?
     private var observation: NSKeyValueObservation?
     private var download: URLSessionDownloadTask?
@@ -91,14 +106,19 @@ struct VMRecord: Codable {
             name = record.name ?? (folder.lastPathComponent == "VM" ? "macOS" : folder.lastPathComponent)
             networkMode = record.networkMode ?? "proxy"; directRules = record.directRules ?? ""
             sharedFolders = record.sharedFolders ?? []; syncKeyboard = record.syncKeyboard ?? true
-            mirrorDesktop = record.mirrorDesktop ?? true; mirrorDownloads = record.mirrorDownloads ?? true
+            // Keep pre-0.6 mount paths stable after removing a different share.
+            for index in sharedFolders.indices where sharedFolders[index].shareName == nil {
+                sharedFolders[index].shareName = "\(index + 1)-" + URL(fileURLWithPath: sharedFolders[index].path).lastPathComponent
+            }
+            preventGuestSleep = record.preventGuestSleep ?? false; preventHostSleep = record.preventHostSleep ?? false
             diskExpansionPending = record.diskExpansionPending ?? false
             diskBackup = record.diskBackup
             optimizePerformance = record.optimizePerformance ?? false
             diskGB = actualDiskGB ?? record.diskGB ?? 64
             host = record.proxyHost ?? host; port = record.proxyPort ?? port; username = record.proxyUser ?? username
             sharedClipboard = record.clipboard ?? sharedClipboard; hostShortcuts = UserDefaults.standard.object(forKey: "shortcuts." + folder.path) as? Bool ?? record.hostShortcuts ?? true } else { installed = false }
-        status = installed ? L("Нажми «Запустить macOS».", "Ready to start.") : L("Выбери режим сети и образ macOS.", "Choose a network mode and a macOS image.")
+        suspended = savedState.exists
+        status = suspended ? L("VM приостановлена. Нажми «Продолжить macOS».", "VM suspended. Choose Resume macOS.") : installed ? L("Нажми «Запустить macOS».", "Ready to start.") : L("Выбери режим сети и образ macOS.", "Choose a network mode and a macOS image.")
     }
     func chooseImage() {
         let p = NSOpenPanel(); p.canChooseFiles = true; p.canChooseDirectories = false; p.message = L("Выбери macOS Restore Image (.ipsw) для Apple Silicon", "Choose a macOS Restore Image (.ipsw) for Apple Silicon")
@@ -124,10 +144,41 @@ struct VMRecord: Codable {
     func addSharedFolders() {
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = true
         guard panel.runModal() == .OK else { return }
-        let previous = sharedFolders
-        for url in panel.urls where !sharedFolders.contains(where: { $0.path == url.path }) { sharedFolders.append(SharedFolder(path: url.path)) }
-        do { try persistSettings() } catch { sharedFolders = previous; self.error = Self.describe(error) }
+        var proposed = sharedFolders
+        for url in panel.urls where !proposed.contains(where: { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath() == url.resolvingSymlinksInPath() }) {
+            let base = VZMultipleDirectoryShare.canonicalizedName(from: url.lastPathComponent) ?? "Shared Folder"
+            var name = base, suffix = 2
+            while proposed.contains(where: { $0.mountName.lowercased() == name.lowercased() }) { name = String(base.prefix(60)) + "-\(suffix)"; suffix += 1 }
+            proposed.append(SharedFolder(path: url.path, shareName: name))
+        }
+        updateSharedFolders(proposed)
     }
+    func updateSharedFolders(_ proposed: [SharedFolder]) {
+        guard !busy else { return }
+        let previous = sharedFolders
+        do {
+            let share = try Self.directoryShare(proposed)
+            sharedFolders = proposed
+            if let machine {
+                guard let device = machine.directorySharingDevices.first as? VZVirtioFileSystemDevice else { throw AppError.message(L("Перезапусти VM для обновления общих папок.", "Restart the VM to update shared folders.")) }
+                try saveRecord(installed: installed)
+                device.share = share
+            } else { try persistSettings() }
+        } catch { sharedFolders = previous; self.error = Self.describe(error) }
+    }
+    static func directoryShare(_ folders: [SharedFolder]) throws -> VZMultipleDirectoryShare {
+        var directories: [String: VZSharedDirectory] = [:]
+        for folder in folders {
+            let url = URL(fileURLWithPath: folder.path)
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isReadableKey])
+            guard values.isDirectory == true, values.isReadable == true else { throw AppError.message(L("Папка недоступна: ", "Folder is unavailable: ") + folder.path) }
+            try VZMultipleDirectoryShare.validateName(folder.mountName)
+            guard directories[folder.mountName] == nil else { throw AppError.message("Duplicate shared folder name") }
+            directories[folder.mountName] = VZSharedDirectory(url: url, readOnly: folder.readOnly)
+        }
+        return VZMultipleDirectoryShare(directories: directories)
+    }
+
     func checkProxy() { operation { [self] in
         proxyChecked = false; status = L("Проверка настроек сети…", "Checking network settings…"); try await checkNetwork()
         if networkMode == "proxy" { try savePassword() }
@@ -184,13 +235,13 @@ struct VMRecord: Codable {
             try saveRecord(installed: true); installed = true
             // Installer can leave the machine running. Preserve its display and network.
             running = vm.state == .running
-            if running { showVM() } else { cleanup() }
+            if running { try? hostSleep.setEnabled(preventHostSleep); showVM() } else { cleanup() }
             status = L("macOS установлена.", "macOS installed.")
         } catch { cleanup(); throw error }
         observation = nil; installer = nil
     } }
-    func saveRecord(installed: Bool) throws { try JSONEncoder().encode(VMRecord(networkMode: networkMode, directRules: directRules, sharedFolders: sharedFolders, syncKeyboard: syncKeyboard, mirrorDesktop: mirrorDesktop, mirrorDownloads: mirrorDownloads, diskBackup: diskBackup, optimizePerformance: optimizePerformance, memoryGB: memoryGB, cpus: cpus, installed: installed, macAddress: macAddress, name: name, diskGB: diskGB, proxyHost: host, proxyPort: port, proxyUser: username, clipboard: sharedClipboard, hostShortcuts: hostShortcuts, diskExpansionPending: diskExpansionPending)).write(to: recordURL, options: .atomic) }
-    func makeMachine() async throws -> VZVirtualMachine {
+    func saveRecord(installed: Bool) throws { try JSONEncoder().encode(VMRecord(networkMode: networkMode, directRules: directRules, sharedFolders: sharedFolders, syncKeyboard: syncKeyboard, diskBackup: diskBackup, preventGuestSleep: preventGuestSleep, preventHostSleep: preventHostSleep, optimizePerformance: optimizePerformance, memoryGB: memoryGB, cpus: cpus, installed: installed, macAddress: macAddress, name: name, diskGB: diskGB, proxyHost: host, proxyPort: port, proxyUser: username, clipboard: sharedClipboard, hostShortcuts: hostShortcuts, diskExpansionPending: diskExpansionPending)).write(to: recordURL, options: .atomic) }
+    func makeMachine(restoring: Bool = false) async throws -> VZVirtualMachine {
         let hardwareData = try Data(contentsOf: folder.appendingPathComponent("Hardware.bin"))
         let idData = try Data(contentsOf: folder.appendingPathComponent("Machine.bin"))
         guard let hardware = VZMacHardwareModel(dataRepresentation: hardwareData), let identifier = VZMacMachineIdentifier(dataRepresentation: idData) else { throw AppError.message(L("Повреждены файлы конфигурации VM.", "The VM configuration files are damaged.")) }
@@ -204,40 +255,31 @@ struct VMRecord: Codable {
         config.keyboards = [VZUSBKeyboardConfiguration()]; config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
         config.storageDevices = [VZVirtioBlockDeviceConfiguration(attachment: try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false))]
         // Keep the control channel even when features are disabled so the guest can
-        // restore local Desktop/Downloads after mirror toggles are turned off.
+        // restore old Desktop/Downloads mirrors and receive live sleep preferences.
         do {
             let tools = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Isola Tools.cdr")
-            let toolsDisk = try VZDiskImageStorageDeviceAttachment(url: tools, readOnly: true)
+            // Pin the read-only Tools media for the whole session, including an
+            // app update while suspended. Restore must attach the original bytes.
+            if !restoring {
+                let data = try Data(contentsOf: tools)
+                try data.write(to: savedState.tools, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: savedState.tools.path)
+            }
+            let toolsDisk = try VZDiskImageStorageDeviceAttachment(url: savedState.tools, readOnly: true)
             config.storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: toolsDisk))
-            let clipboard = try ClipboardBridge(clipboardEnabled: sharedClipboard, syncKeyboard: syncKeyboard, desktop: mirrorDesktop, downloads: mirrorDownloads, optimizePerformance: optimizePerformance,
-                onPerformanceStatus: { [weak self] in self?.performanceStatus = $0 },
-                onStatus: { [weak self] in self?.integrationStatus = $0 }, onKeyboardStatus: { [weak self] in self?.keyboardStatus = $0 }); clipboardBridge = clipboard
+            let clipboard = try newClipboardBridge(); clipboardBridge = clipboard
             config.consoleDevices = [clipboard.device]
         }
-        if !sharedFolders.isEmpty || mirrorDesktop || mirrorDownloads {
-            var directories: [String: VZSharedDirectory] = [:]
-            for (index, folder) in sharedFolders.enumerated() {
-                let url = URL(fileURLWithPath: folder.path)
-                let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isReadableKey])
-                guard values.isDirectory == true, values.isReadable == true else { throw AppError.message("Папка недоступна: " + folder.path) }
-                directories["\(index + 1)-" + url.lastPathComponent] = VZSharedDirectory(url: url, readOnly: folder.readOnly)
-            }
-            for (kind, enabled, name) in [(FileManager.SearchPathDirectory.desktopDirectory, mirrorDesktop, "Desktop"), (.downloadsDirectory, mirrorDownloads, "Downloads")] where enabled {
-                let url = try FileManager.default.url(for: kind, in: .userDomainMask, appropriateFor: nil, create: true)
-                // Request filesystem access before starting; TCC errors must be visible to the user.
-                _ = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-                directories["Isola " + name] = VZSharedDirectory(url: url, readOnly: false)
-            }
-            let share = VZVirtioFileSystemDeviceConfiguration(tag: VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag)
-            share.share = VZMultipleDirectoryShare(directories: directories)
-            config.directorySharingDevices = [share]
-        }
+        // Keep a filesystem device even when empty so folders can be added live.
+        let share = VZVirtioFileSystemDeviceConfiguration(tag: VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag)
+        share.share = try Self.directoryShare(sharedFolders)
+        config.directorySharingDevices = [share]
         guard let address = VZMACAddress(string: macAddress), address.isLocallyAdministeredAddress, address.isUnicastAddress else { throw AppError.message(L("Некорректный MAC-адрес VM.", "Invalid VM MAC address.")) }
         let network = VZVirtioNetworkDeviceConfiguration(); network.macAddress = address
         if networkMode == "direct" {
             network.attachment = VZNATNetworkDeviceAttachment(); config.networkDevices = [network]
             try config.validate()
-            let vm = VZVirtualMachine(configuration: config); vm.delegate = self; return vm
+            let vm = VZVirtualMachine(configuration: config); vm.delegate = self; machineConfiguration = config; clipboardBridge?.bind(to: vm); return vm
         }
         var networkSettings = proxy; networkSettings.GuestMAC = macAddress
         let gateway = try NetworkBridge(); bridge = gateway
@@ -246,13 +288,19 @@ struct VMRecord: Codable {
             guard let self, let gateway, self.bridge === gateway else { return }
             self.status = L("Сетевой шлюз остановлен. Интернет VM заблокирован.", "Network gateway stopped. Guest internet is blocked.")
         }
-        let vm = VZVirtualMachine(configuration: config); vm.delegate = self; return vm
+        let vm = VZVirtualMachine(configuration: config); vm.delegate = self; machineConfiguration = config; clipboardBridge?.bind(to: vm); return vm
     }
     func start(recovery: Bool = false) { operation { [self] in
         guard installed else { throw AppError.message(L("Сначала установи macOS.", "Install macOS first.")) }
         guard machine == nil else { throw AppError.message(L("VM уже запущена.", "The VM is already running.")) }
         sessionLock = try VMDirectoryLock(folder: folder)
-        defer { if !running { cleanup() } }
+        defer { if !running { cleanup() }; suspended = savedState.exists }
+        if savedState.exists {
+            reload(); password = readPassword()
+            guard !recovery else { throw AppError.message(L("Сначала продолжи VM или удали сохранённое состояние, затем запускай Recovery.", "Resume the VM or discard its saved state before starting Recovery.")) }
+            try await restoreSuspendedMachine()
+            return
+        }
         status = L("Проверка настроек сети…", "Checking network settings…")
         if !recovery { try await checkNetwork() }
         do {
@@ -260,12 +308,103 @@ struct VMRecord: Codable {
             let options = VZMacOSVirtualMachineStartOptions(); options.startUpFromMacOSRecovery = recovery
             try await vm.start(options: options)
             running = true; status = recovery ? L("macOS Recovery работает", "macOS Recovery is running") : L("macOS работает", "macOS is running")
+            do { try hostSleep.setEnabled(preventHostSleep) } catch { self.error = Self.describe(error) }
             showVM()
         } catch { cleanup(); throw error }
     } }
-    func stop() { guard let machine else { return }; do { try machine.requestStop(); status = L("Подтвердите выключение на экране гостевой macOS.", "Confirm shutdown on the guest macOS screen.") } catch { self.error = error.localizedDescription } }
+    func stop() { guard !busy, let machine else { return }; do { try machine.requestStop(); status = L("Подтвердите выключение на экране гостевой macOS.", "Confirm shutdown on the guest macOS screen.") } catch { self.error = error.localizedDescription } }
     func forceStop() { operation { [self] in if let machine { try await machine.stop() }; cleanup(); status = L("VM остановлена.", "VM stopped.") } }
-    func cleanup() { displayView?.virtualMachine = nil; displayView = nil; machine = nil; clipboardBridge?.stop(); clipboardBridge = nil; bridge?.stop(); bridge = nil; running = false; sessionLock = nil }
+    func cleanup() { machineConfiguration = nil; remoteHost.stop(); hostSleep.stop(); displayView?.virtualMachine = nil; displayView = nil; machine = nil; clipboardBridge?.stop(); clipboardBridge = nil; bridge?.stop(); bridge = nil; running = false; sessionLock = nil }
+    private func newClipboardBridge() throws -> ClipboardBridge {
+        try ClipboardBridge(clipboardEnabled: sharedClipboard, syncKeyboard: syncKeyboard, preventSleep: preventGuestSleep, optimizePerformance: optimizePerformance,
+                onPerformanceStatus: { [weak self] in self?.performanceStatus = $0 },
+                onSleepStatus: { [weak self] in self?.sleepStatus = $0 },
+                onToolsVersion: { [weak self] in self?.toolsVersion = $0 },
+                onStatus: { [weak self] in self?.integrationStatus = $0 }, onKeyboardStatus: { [weak self] in self?.keyboardStatus = $0 })
+    }
+    func requireColdMachine() throws {
+        guard !configurationLocked else { throw AppError.message(L("Для изменения настроек продолжи VM и выключи macOS, либо удали сохранённое состояние.", "To change settings, resume and shut down macOS, or discard the saved state.")) }
+    }
+    func suspend() { operation { [self] in try await suspendMachine() } }
+    // Also used by the asynchronous Save & Quit flow, which owns the busy flag.
+    func suspendMachine() async throws {
+        guard let vm = machine, vm.state == .running || vm.state == .paused, let config = machineConfiguration else {
+            throw AppError.message(L("Нет работающей VM для сохранения.", "There is no running VM to save."))
+        }
+        try config.validateSaveRestoreSupport()
+        guard !savedState.exists else { throw AppError.message(L("Сначала устрани незавершённое сохранение VM.", "Resolve the unfinished saved state first.")) }
+        guard freeGB >= memoryGB + 2 else {
+            throw AppError.message(L("Для паузы нужно хотя бы \(memoryGB + 2) ГБ свободного места на хосте.", "Suspending needs at least \(memoryGB + 2) GB free on the host."))
+        }
+        suspending = true
+        defer { suspending = false; suspended = savedState.exists }
+        remoteHost.stop()
+        status = L("Подготовка к паузе…", "Preparing to suspend…")
+        var committed = false
+        var integrationDisconnected = false
+        do {
+            try await clipboardBridge?.disconnectForSuspend()
+            clipboardBridge?.stop(); clipboardBridge = nil
+            integrationDisconnected = true
+            if vm.state == .running { try await vm.pause() }
+            let target = try savedState.begin()
+            status = L("Сохранение памяти VM…", "Saving VM memory…")
+            try await vm.saveMachineStateTo(url: target)
+            try savedState.commit(); committed = true
+            // Do not release the VM lock until Virtualization releases the disk.
+            try await vm.stop()
+            try savedState.finishStopping()
+            cleanup()
+            status = L("VM приостановлена. Можно закрыть Isola.", "VM suspended. You can quit Isola.")
+        } catch {
+            if vm.state == .stopped { cleanup() }
+            else {
+                // If committing failed, remove even a completed rename before
+                // letting the original CPU run again against its disk.
+                do {
+                    if committed || FileManager.default.fileExists(atPath: savedState.committed.path) { try savedState.discard() }
+                    else { try savedState.cancelPreparation() }
+                    if integrationDisconnected {
+                        let clipboard = try newClipboardBridge(); clipboardBridge = clipboard
+                        clipboard.bind(to: vm); clipboard.reconnect()
+                    }
+                    if vm.state == .paused { try await vm.resume() }
+                    running = vm.state == .running
+                } catch let rollbackError {
+                    running = false
+                    throw AppError.message(Self.describe(error) + "\n" + Self.describe(rollbackError))
+                }
+            }
+            throw error
+        }
+    }
+    private func restoreSuspendedMachine() async throws {
+        status = L("Проверка сохранённого состояния…", "Checking saved state…")
+        _ = try savedState.validate()
+        // Reopen the configured adapter even if the SOCKS server is temporarily
+        // offline. The gateway still fails closed; apps can reconnect later.
+        let vm = try await makeMachine(restoring: true); machine = vm
+        try machineConfiguration?.validateSaveRestoreSupport()
+        status = L("Восстановление памяти VM…", "Restoring VM memory…")
+        try await vm.restoreMachineStateFrom(url: savedState.stateFile)
+        try savedState.consume()
+        // The guest helper closed the old console before suspension. Reattach
+        // a fresh endpoint; its LaunchAgent reconnects and negotiates settings.
+        clipboardBridge?.reconnect()
+        try await vm.resume()
+        running = true
+        try savedState.finishResume()
+        suspended = false
+        try? hostSleep.setEnabled(preventHostSleep)
+        status = L("macOS продолжает работу", "macOS resumed")
+        showVM()
+    }
+    func discardSavedState() { operation { [self] in
+        guard machine == nil else { throw AppError.message(L("Сначала останови VM.", "Stop the VM first.")) }
+        let lock = try VMDirectoryLock(folder: folder); defer { withExtendedLifetime(lock) {}; suspended = savedState.exists }
+        try savedState.discard()
+        status = L("Сохранённая память удалена. Диск VM сохранён.", "Saved memory discarded. The VM disk was kept.")
+    } }
     func setPerformance(_ enabled: Bool) {
         guard !busy else { return }
         let previous = optimizePerformance
@@ -276,6 +415,24 @@ struct VMRecord: Codable {
             if let clipboardBridge { clipboardBridge.setPerformance(enabled) }
             else { performanceStatus = L("Применится после запуска VM и подключения Isola Tools.", "Applies when the VM starts and Isola Tools connects.") }
         } catch { optimizePerformance = previous; self.error = Self.describe(error) }
+    }
+    func setSleep(guest: Bool? = nil, host: Bool? = nil) {
+        guard !busy else { return }
+        let oldGuest = preventGuestSleep, oldHost = preventHostSleep
+        if let guest { preventGuestSleep = guest }
+        if let host { preventHostSleep = host }
+        do {
+            try hostSleep.setEnabled(running && preventHostSleep)
+            if machine != nil { try saveRecord(installed: installed) } else { try persistSettings() }
+            if guest != nil {
+                if let clipboardBridge { clipboardBridge.setPreventSleep(preventGuestSleep) }
+                else { sleepStatus = L("Применится после запуска VM и подключения Isola Tools.", "Applies when the VM starts and Isola Tools connects.") }
+            }
+        } catch {
+            preventGuestSleep = oldGuest; preventHostSleep = oldHost
+            try? hostSleep.setEnabled(running && oldHost)
+            self.error = Self.describe(error)
+        }
     }
     func switchKeyboard() {
         guard syncKeyboard, machine != nil else { return }
@@ -292,18 +449,20 @@ struct VMRecord: Codable {
         return Int((size ?? 0) / 1_073_741_824)
     }
     func persistSettings() throws {
-        guard machine == nil else { throw AppError.message(L("Выключите VM перед изменением настроек.", "Shut down the VM before changing settings.")) }
+        try requireColdMachine()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let lock = try VMDirectoryLock(folder: folder); defer { withExtendedLifetime(lock) {} }
+        try requireColdMachine()
         try saveRecord(installed: installed)
     }
     func saveResources(cpu: Int, memory: Int, disk: Int, title: String, completion: @escaping () -> Void) {
         operation { [self] in
-            guard machine == nil else { throw AppError.message("Сначала выключите VM.") }
+            try requireColdMachine()
             guard (2...Self.maximumCPUs).contains(cpu), (4...Self.maximumMemoryGB).contains(memory), (64...2048).contains(disk), disk >= (actualDiskGB ?? 64) else { throw AppError.message("Некорректный размер диска или ресурсы.") }
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let lock = try VMDirectoryLock(folder: folder)
             defer { withExtendedLifetime(lock) {} }
+            try requireColdMachine()
             if installed && (disk > (actualDiskGB ?? disk) || diskExpansionPending) {
                 status = "Подготовка резервной копии и расширение основного тома…"
                 let directory = folder, bytes = UInt64(disk) * 1_073_741_824
@@ -322,10 +481,11 @@ struct VMRecord: Codable {
         }
     }
     func applyResources(cpu: Int, memory: Int, disk: Int, title: String) throws {
-        guard !busy, machine == nil else { throw AppError.message(L("Сначала выключите VM.", "Shut down the VM first.")) }
+        guard !busy else { throw AppError.message(L("Дождись завершения операции.", "Wait for the current operation.")) }; try requireColdMachine()
         guard (2...Self.maximumCPUs).contains(cpu), (4...Self.maximumMemoryGB).contains(memory), (64...2048).contains(disk) else { throw AppError.message(L("Ресурсы вне допустимого диапазона.", "Resources are outside the supported range.")) }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let lock = try VMDirectoryLock(folder: folder); defer { withExtendedLifetime(lock) {} }
+        try requireColdMachine()
         let oldDisk = actualDiskGB
         guard disk >= (oldDisk ?? 64) else { throw AppError.message(L("Уменьшение диска не поддерживается.", "Shrinking a disk is not supported.")) }
         if let oldDisk, disk > oldDisk {
@@ -341,11 +501,11 @@ struct VMRecord: Codable {
         status = L("Настройки сохранены. Применятся при следующем запуске.", "Settings saved. They take effect on the next start.")
     }
     nonisolated func guestDidStop(_ virtualMachine: VZVirtualMachine) { Task { @MainActor in
-        guard self.machine === virtualMachine, self.installer == nil else { return }
+        guard self.machine === virtualMachine, self.installer == nil, !self.suspending else { return }
         self.cleanup(); self.status = L("macOS выключена.", "macOS shut down.")
     } }
     nonisolated func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) { Task { @MainActor in
-        guard self.machine === virtualMachine, self.installer == nil else { return }
+        guard self.machine === virtualMachine, self.installer == nil, !self.suspending else { return }
         self.cleanup(); self.error = Self.describe(error); self.status = L("VM остановлена из-за ошибки.", "VM stopped due to an error.")
     } }
     private var key: [String: Any] { [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "local.isola.proxy", kSecAttrAccount as String: "\(host):\(port):\(username)"] }

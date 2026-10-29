@@ -2,13 +2,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo 'Tests require Apple Silicon macOS.' >&2; exit 1; }
-case "${1:-}" in ''|--ui|--disk) ;; *) echo 'Usage: bash scripts/test.sh [--ui|--disk]' >&2; exit 1 ;; esac
+case "${1:-}" in ''|--ui|--disk|--stream) ;; *) echo 'Usage: bash scripts/test.sh [--ui|--disk|--stream]' >&2; exit 1 ;; esac
 mkdir -p .build
 SWIFT=(xcrun swiftc -swift-version 5 -target arm64-apple-macosx14.0 -parse-as-library)
 (cd Network && go test -race ./... && go build -o ../.build/isola-network-test .)
 python3 scripts/test_helper.py .build/isola-network-test
-for TEST in ClipboardSmoke GuestPerformanceSmoke HomeMirrorsSmoke; do
+for TEST in ClipboardSmoke ClipboardTransferSmoke GuestPerformanceSmoke LegacyHomeRestoreSmoke SleepSmoke RemoteCursorSmoke; do
     "${SWIFT[@]}" Sources/Shared/*.swift "Tests/$TEST.swift" -o ".build/$TEST" -framework AppKit
+    ".build/$TEST"
+done
+"${SWIFT[@]}" Sources/Shared/*.swift Sources/Isola/RemoteProtocol.swift Sources/Isola/RemoteStreamSettings.swift Tests/RemoteNetworkSmoke.swift -o .build/RemoteNetworkSmoke -framework AppKit
+.build/RemoteNetworkSmoke
+for TEST in RemoteVideoSmoke RemoteClipboardSmoke RemoteDiscoverySmoke SuspendedStateSmoke; do
+    "${SWIFT[@]}" -D WINDOW_LIFECYCLE_TEST Sources/Shared/*.swift Sources/Isola/*.swift "Tests/$TEST.swift" -o ".build/$TEST" -framework AppKit -framework SwiftUI -framework Virtualization -framework Security
     ".build/$TEST"
 done
 "${SWIFT[@]}" -D WINDOW_LIFECYCLE_TEST Sources/Shared/*.swift Sources/Isola/*.swift Tests/ResourcesSmoke.swift -o .build/ResourcesSmoke -framework AppKit -framework SwiftUI -framework Virtualization -framework Security
@@ -20,4 +26,9 @@ fi
 if [[ "${1:-}" == --disk ]]; then
     "${SWIFT[@]}" Sources/Isola/DiskExpansion.swift Sources/Isola/VMDirectoryLock.swift Tests/DiskExpansionSmoke.swift -o .build/disk-expansion-smoke
     python3 scripts/test_disk_expansion.py
+fi
+
+if [[ "${1:-}" == --stream ]]; then
+    "${SWIFT[@]}" -D WINDOW_LIFECYCLE_TEST Sources/Shared/*.swift Sources/Isola/*.swift Tests/RemoteStreamSmoke.swift -o .build/RemoteStreamSmoke -framework AppKit -framework SwiftUI -framework Virtualization -framework Security
+    .build/RemoteStreamSmoke
 fi
